@@ -37,7 +37,6 @@ class EditOp(object):
         self.edit_type = etype
         self.object_type = otype
         self.pos = pos
-        self.cnt = 0
         self.value = ""
         self.backwards = False
 
@@ -65,7 +64,7 @@ class EditOp(object):
                     else:
                         _buffer[y] = _buffer[y][:x]
                 else:
-                    _buffer[y] = _buffer[y][:x]+_buffer[y][x+self.cnt:]
+                    _buffer[y] = _buffer[y][:x]+_buffer[y][x+len(self.value):]
             elif self.edit_type == "insert":
                 if "\n" in self.value:
                     segments = self.value.split("\n")
@@ -77,18 +76,19 @@ class EditOp(object):
             else:
                 # TODO: need to handle carriage return
                 _buffer[y] = _buffer[y][:x] + self.replacement + _buffer[y][x+len(self.value):]
-        else: #line
+        else: # line
+            assert isinstance(self.value, list) # invariant
             if self.edit_type == "delete":
-                del _buffer[y:y+self.cnt]
+                del _buffer[y:y+len(self.value)]
             elif self.edit_type =="insert":
-                _buffer.insert(y, self.value)
+                for line in reversed(self.value):
+                    _buffer.insert(y, line)
             else:
                 del _buffer[y:y+len(self.value)]
-                _buffer.insert(y, self.replacement)
+                for line in reversed(self.replacement):
+                    _buffer.insert(y, line)
         # after apply, editor should refresh view
-
     def append_edit(self, char):
-        self.cnt += len(char)
         self.value += char
 
 class EditList(object):
@@ -143,6 +143,19 @@ class EditList(object):
         self.edits.append(op)
         self.cursor += 1
 
+class ClipBoard(object):
+    def __init__(self):
+        self.type = "char" # either char or line
+        self.value = ""
+    def store(self, value):
+        if isinstance(value, basestring):
+            self.type = "char"
+        else:
+            self.type = "line"
+        self.value = value
+    def retrieve(self):
+        return self.type, self.value
+
 class Editor(object):
     def __init__(self, f, buf):
         self.outfile = f
@@ -165,12 +178,15 @@ class Editor(object):
         self.mode = "command"
         self.command_editing = False
         self.pos = (0,0) # line and column of buffer
-        self.partial = ""
+        self.partial = "" # partial cmd in command mode
         self.status_line = "-- COMMAND --"
-        self.commandline = ""
+        self.commandline = "" # command entered in command line at the bottom of screen
         self.checkpoint = -1 # pointer into the editlist where save happens
         self.searchpos = (0,0)
-        self.searchkw = ""
+        self.searchkw = None
+        self.searchdir = "forward"
+        self.clipboard = ClipBoard()
+        self.showlineno = False
         # render the initial screen
         self.refresh()
         self.refresh_command_line()
@@ -215,10 +231,20 @@ class Editor(object):
             ("gg", "goto_first_line"),
             ("dw", "delete_word"),
             ("dW", "delete_term"),
+            ("yw", "yank_word"),
+            ("yW", "yank_term"),
             ("dd", "delete_line"),
+            ("yy", "yank_line"),
             ("r", "replace_char"),
             ("i", "insert_mode"),
-            ("o", "insert_line"),
+            ("I", "insert_line_start"),
+            ("o", "insert_line_after"),
+            ("O", "insert_line_before"),
+            ("a", "insert_after"),
+            ("A", "insert_line_end"),
+            ("s", "delete_char_insert"),
+            ("S", "delete_line_insert"),
+            ("D", "delete_line_end"),
             ("u", "undo"),
             (".", "repeat_edit"),
             ("^", "goto_line_start"),
@@ -243,6 +269,11 @@ class Editor(object):
             ("%", "match_pair"),
             ("/", "search_mode"),
             ("?", "reverse_search_mode"),
+            ("n", "search_next"),
+            ("N", "search_previous"),
+            ("Y", "yank_line"),
+            ("p", "paste_after"),
+            ("P", "paste_before"),
         ]
         chr_cmd_map = dict(chr_cmd_tuples)
         meta_cmd_map = {
@@ -251,6 +282,13 @@ class Editor(object):
             curses.ascii.STX: "prev_page", # CTRL + B
             curses.ascii.ENQ: "scroll_down", # CTRL + E
             curses.ascii.EM: "scroll_up", # CTRL + Y
+            curses.KEY_DC: "delete_char",
+            curses.KEY_BACKSPACE: "backup_char",
+            curses.KEY_HOME: "goto_line_start",
+            curses.KEY_END: "goto_line_end",
+            curses.KEY_PPAGE: "prev_page",
+            curses.KEY_NPAGE:"next_page",
+            127: "backup_char", # on Mac, backspace key doesn't map to curses.KEY_BACKSPACE
         }
 
         if curses.ascii.isprint(ch):
@@ -281,7 +319,7 @@ class Editor(object):
                         self.partial = ""
                         return cmd
         else:
-            # when meet a meta command, clear the partial
+            # when meet a meta key, clear the partial command
             self.partial = ""
             if ch in meta_cmd_map:
                 return meta_cmd_map[ch]
@@ -353,21 +391,56 @@ class Editor(object):
             cmd = cmd[0]
         else:
             parameter = None
-        if cmd == "insert_mode":
-            self.mode = "editing"
-            self.refresh_command_line()
-        elif cmd == "insert_line":
-            self.mode = "editing"
+        ### commands for switching to editing mode ###
+        if cmd == "insert_line_after":
             self.buffer.insert(self.pos[0]+1, "")
             self.pos = (self.pos[0]+1, 0)
             self.refresh()
             self.refresh_cursor()
-            self.refresh_command_line()
+        elif cmd == "insert_line_before":
+            self.buffer.insert(self.pos[0], "")
+            self.pos = (self.pos[0], 0)
+            self.refresh()
+            self.refresh_cursor()
+        elif cmd == "insert_line_start":
+            self.pos = (self.pos[0], 0)
+            self.refresh_cursor()
+        elif cmd == "insert_after":
+            if self.buffer[self.pos[0]]:
+                self.pos = (self.pos[0], self.pos[1]+1)
+                self.refresh_cursor()
+        elif cmd == "insert_line_end":
+            self.pos = (self.pos[0], len(self.buffer[self.pos[0]]))
+            self.refresh_cursor()
+        elif cmd == "delete_char_insert":
+            s = self.buffer[self.pos[0]]
+            if s:
+                char = s[self.pos[1]]
+                s = s[:self.pos[1]]+s[self.pos[1]+1:]
+                self.buffer[self.pos[0]] = s
+                self.refresh()
+                self.refresh_cursor()
+                self.editop = EditOp(self, "delete", "char", self.pos)
+                self.editop.value = char
+                self.commit_current_edit()
+        elif cmd == "delete_line_insert":
+            s = self.buffer[self.pos[0]]
+            if s:
+                oldline = self.buffer[self.pos[0]]
+                self.buffer[self.pos[0]] = ""
+                self.pos = self.pos[0], 0
+                self.refresh()
+                self.refresh_cursor()
+                self.editop = EditOp(self, "replace", "char", (self.pos[0], 0))
+                self.editop.value = oldline
+                self.editop.replacement = ""
+                self.commit_current_edit()
+        ### commands for moving cursor position ###
         elif cmd == "goto_line_start":
             self.pos = (self.pos[0], 0)
             self.refresh_cursor()
         elif cmd == "goto_line_end":
-            self.pos = (self.pos[0], len(self.buffer[self.pos[0]])-1)
+            self.pos = (self.pos[0], max(len(self.buffer[self.pos[0]])-1, 0))
             self.refresh_cursor()
         elif cmd == "goto_prev_line_start":
             if self.pos[0]>0:
@@ -533,17 +606,21 @@ class Editor(object):
             idx = self.advance_term(s, idx, "backwards")
             self.pos = self.pos[0], idx+1
             self.refresh_cursor()
+        elif cmd == "backup_char":
+            self.pos = self.pos[0], max(self.pos[1]-1,0)
+            self.refresh_cursor()
+        ### commands for managing edits history ###
         elif cmd == "undo": # for undo
             pos = self.editlist.get_pos()
             if not self.editlist.undo():
-                self.flash_status_line("--Already at the earliest edit--")
+                self.flash_status_line("-- Already at the first edit --")
             else:
                 self.pos = pos
                 self.refresh()
                 self.refresh_cursor()
         elif cmd=="redo": # Ctrl+R for redo
             if not self.editlist.redo():
-                self.flash_status_line("--Already at the lastest edit--")
+                self.flash_status_line("-- Already at the last edit --")
             else:
                 self.pos = self.editlist.get_pos()
                 self.refresh()
@@ -553,73 +630,87 @@ class Editor(object):
                 self.pos = self.editlist.get_pos()
                 self.refresh()
                 self.refresh_cursor()
+        ### commands for entering command editing mode (Ex mode) ###
         elif cmd in ("command_edit_mode", "search_mode", "reverse_search_mode"):
             self.command_editing = True
             self.commandline = chr(ch)
             self.refresh_command_line()
+        ### edit commands ###
         elif cmd == "switch_case":
             line = self.buffer[self.pos[0]]
             ch = line[self.pos[1]]
             if ch in string.letters:
-                if ch in string.lowercase:
-                    line = line[:self.pos[1]]+ch.upper()+line[self.pos[1]+1:]
-                elif ch in string.uppercase:
-                    line = line[:self.pos[1]]+ch.lower()+line[self.pos[1]+1:]
+                line = line[:self.pos[1]]+ch.swapcase()+line[self.pos[1]+1:]
                 self.buffer[self.pos[0]] = line
                 self.refresh()
+                # add edit operation to list
+                self.editop = EditOp(self, "replace", "char", self.pos)
+                self.editop.value = ch
+                self.editop.replacement = ch.swapcase()
+                self.commit_current_edit()
             if self.pos[1]<len(line)-1:
                 self.pos = self.pos[0], self.pos[1]+1
             self.refresh_cursor()
-        elif cmd == "delete_char":
+        elif cmd in ("delete_char", "delete_last_char"):
             self.handle_delete_char(ch)
-        elif cmd == "delete_last_char":
-            self.handle_delete_char(ch)
-        elif cmd == "delete_word":
+        elif cmd in ("delete_word", "yank_word"):
             s = self.buffer[self.pos[0]]
             idx = self.pos[1]
             idx = self.advance_word(s, idx)
             idx = self.advance_spaces(s, idx)
-            self.buffer[self.pos[0]] = s[:self.pos[1]]+s[idx:]
-            self.refresh()
+            if cmd =="delete_word":
+                self.buffer[self.pos[0]] = s[:self.pos[1]]+s[idx:]
+                self.refresh()
             if self.pos[1]<idx:
-                self.start_new_char_edit("delete", self.pos)
-                self.editop.append_edit(s[self.pos[1]:idx])
-                self.commit_current_edit()
-            if self.pos[1] >= len(s): 
-                newx = self.pos[1]-1
-            else:
-                newx = self.pos[1]
-            self.pos = self.pos[0], max(newx, 0)
+                deleted = s[self.pos[1]:idx]
+                self.clipboard.store(deleted)
+                if cmd =="delete_word":
+                    self.start_new_char_edit("delete", self.pos)
+                    self.editop.append_edit(deleted)
+                    self.commit_current_edit()
+            if cmd =="delete_word":
+                if self.pos[1] >= len(s): 
+                    newx = self.pos[1]-1
+                else:
+                    newx = self.pos[1]
+                self.pos = self.pos[0], max(newx, 0)
             self.refresh_cursor()
-        elif cmd == "delete_term":
+        elif cmd in ("delete_term", "yank_term"):
             s = self.buffer[self.pos[0]]
             idx = self.pos[1]
             idx = self.advance_term(s, idx)
             idx = self.advance_spaces(s, idx)
-            self.buffer[self.pos[0]] = s[:self.pos[1]]+s[idx:]
-            self.refresh()
+            if cmd =="delete_term":
+                self.buffer[self.pos[0]] = s[:self.pos[1]]+s[idx:]
+                self.refresh()
             if self.pos[1]<idx:
-                self.start_new_char_edit("delete", self.pos)
-                self.editop.append_edit(s[self.pos[1]:idx])
-                self.commit_current_edit()
-            if idx >= len(s): 
-                newx = self.pos[1]-1
-            else:
-                newx = self.pos[1]
-            self.pos = self.pos[0], max(newx, 0)
+                deleted = s[self.pos[1]:idx]
+                self.clipboard.store(deleted)
+                if cmd =="delete_term":
+                    self.start_new_char_edit("delete", self.pos)
+                    self.editop.append_edit(deleted)
+                    self.commit_current_edit()
+            if cmd =="delete_term":
+                if idx >= len(s): 
+                    newx = self.pos[1]-1
+                else:
+                    newx = self.pos[1]
+                self.pos = self.pos[0], max(newx, 0)
             self.refresh_cursor()
         elif cmd == "delete_line":
             if not len(self.buffer) or (len(self.buffer)==1 and not self.buffer[0]): return
             oldline = self.buffer[self.pos[0]]
+            self.clipboard.store([oldline]) # deleted lines are stored in clipboard
             del self.buffer[self.pos[0]]
-            if not self.buffer:
-                # should preserve at least one blank line
+            if not self.buffer: # should preserve at least one blank line
                 self.buffer =[""]
-            self.refresh()
-            # add a line delete operation
-            self.editop = EditOp(self, "delete", "line", self.pos)
-            self.editop.value = oldline
+                self.editop = EditOp(self, "replace", "line", self.pos)
+                self.editop.replacement = [""]
+            else:
+                self.editop = EditOp(self, "delete", "line", self.pos)
+            self.editop.value = [oldline]
             self.commit_current_edit()
+            self.refresh()
             if self.pos[0] >= len(self.buffer):
                 y = len(self.buffer)-1
             else:
@@ -627,6 +718,19 @@ class Editor(object):
             x = min(self.pos[1], len(self.buffer[y])-1)
             self.pos = y, max(x, 0)
             self.refresh_cursor()
+        elif cmd == "delete_line_end":
+            s = self.buffer[self.pos[0]]
+            if s:
+                oldpos = self.pos
+                deleted = s[self.pos[1]:]
+                self.buffer[self.pos[0]] = s[:self.pos[1]]
+                self.pos = self.pos[0], max(self.pos[1]-1, 0)
+                self.refresh()
+                self.refresh_cursor()
+                self.clipboard.store(deleted)
+                self.editop = EditOp(self, "delete", "char", oldpos)
+                self.editop.value = deleted
+                self.commit_current_edit()
         elif cmd == "replace_char":
             line = self.buffer[self.pos[0]]
             oldchar = line[self.pos[1]]
@@ -639,6 +743,7 @@ class Editor(object):
             self.editop.value = oldchar
             self.editop.replacement = parameter
             self.commit_current_edit()
+        ### search related commands ###
         elif cmd == "match_pair":
             chrs = "()[]{}"
             matcher = {"(":")", ")":"(", "[":"]", "]":"[","{":"}", "}":"{"}
@@ -664,6 +769,51 @@ class Editor(object):
                         self.pos = pos
                         self.refresh_cursor()
                         break
+        elif cmd in ("search_next", "search_previous"):
+            if cmd=="search_next":
+                direction = self.searchdir 
+            else:
+                direction = "forward" if self.searchdir == "backward" else "backward"
+            pos = self.search_for_keyword(direction)
+            if not pos:
+                self.flash_status_line("--Search pattern not found--")
+                return
+            self.pos = pos
+            self.refresh_cursor()
+        ### copy paste commands ###
+        elif cmd == "yank_line":
+            self.clipboard.store([self.buffer[self.pos[0]]])
+        elif cmd in ("paste_before", "paste_after"):
+            t, v = self.clipboard.retrieve()
+            if not v: return
+            if t=="char":
+                line = self.buffer[self.pos[0]]
+                insertx = self.pos[1] if cmd=="paste_before" else self.pos[1]+1
+                self.buffer[self.pos[0]] = line[:insertx] + v +line[insertx:]
+                insert_pos = self.pos[0], insertx
+                if not line: 
+                     self.pos = self.pos[0], len(v) -1
+                else: 
+                     self.pos = self.pos[0], self.pos[1] + len(v)
+                # commit the edit operation
+                self.start_new_char_edit("insert", insert_pos)
+                self.editop.value = v
+                self.commit_current_edit()
+            else:
+                assert isinstance(v, list)
+                inserty = self.pos[0] if cmd =="paste_before" else self.pos[0]+1
+                for line in reversed(v):
+                    self.buffer.insert(inserty, line)
+                self.pos = inserty, 0
+                self.editop = EditOp(self, "insert", "line", self.pos)
+                self.editop.value = v
+                self.commit_current_edit()
+            self.refresh()
+            self.refresh_cursor()                
+        # Check if needs to switching to editing mode
+        if "insert" in cmd:
+            self.mode = "editing"
+            self.refresh_command_line()
 
     def save_file(self):
         assert self.outfile is not None
@@ -681,12 +831,14 @@ class Editor(object):
         if curses.ascii.isprint(ch):
             self.commandline += chr(ch)
             self.refresh_command_line()
-        elif ch==27: # ESC, back to command mode
+        elif ch==curses.KEY_BACKSPACE or ch==127:
+            self.commandline = self.commandline[:-1]
+            self.refresh_command_line()
+        elif ch==27 or ch==curses.ascii.ETX: # ESC, back to command mode
             self.command_editing = False
             self.commandline = ""
             self.refresh_command_line()
             self.refresh_cursor()
-        #elif ch == 
         elif ch==10: # new line \n
             self.command_editing = False
             if self.commandline.startswith(":"):
@@ -721,6 +873,16 @@ class Editor(object):
                                 raise SystemExit()
                             else:
                                 self.flash_status_line("--File saved--")
+                elif commandline in ("nu", "nonu"):
+                    self.showlineno = (commandline=="nu")
+                    if self.showlineno:
+                        self.maxx = self.scr.getmaxyx()[1] - self.get_lineno_width()
+                    else:
+                        self.maxx = self.scr.getmaxyx()[1]
+                    self.refresh()
+                    self.refresh_cursor()
+                else:
+                    self.flash_status_line("-- Command not recognized --")
             elif self.commandline.startswith("/") or self.commandline.startswith("?"):
                 keyword = self.commandline[1:]
                 try:
@@ -758,10 +920,10 @@ class Editor(object):
                 if direction == "forward":
                     mo = self.searchkw.search(line) # left to right
                     if mo:
-                        self.searchpos = y, mo.end()
+                        self.searchpos = y, x+mo.end()
                         if self.searchpos[1] == len(self.buffer[y]):
                             self.searchpos = (y+step)%len(self.buffer), 0
-                        return (y, mo.start())
+                        return (y, x+mo.start())
                 else: # backward
                     # to search right to left for regex: http://stackoverflow.com/questions/33232729/how-to-search-for-the-last-occurrence-of-a-regular-expression-in-a-string-in-pyt
                     starts = [mo.start() for mo in self.searchkw.finditer(line)]
@@ -816,18 +978,19 @@ class Editor(object):
                 
     def handle_delete_char(self, ch):
         if (not self.editop or not self.editop.edit_type == "delete" 
-            or (self.editop.backwards and ch==127) 
-            or (not self.editop.backwards and ch==8)
+            or (self.editop.backwards and ch==curses.KEY_DC) 
+            or (not self.editop.backwards and ch==curses.KEY_BACKSPACE)
             or ch==120 or ch==88):
             self.start_new_char_edit("delete", self.pos)
-            if ch==8 or ch==88: 
+            if ch==curses.KEY_BACKSPACE or ch==88: 
                 self.editop.backwards = True
         y, x = self.pos
-        if ch==127 or ch==120: # del or x
+        if ch==curses.KEY_DC or ch==120: # del or x
             if x == len(self.buffer[y]):
                 if y < len(self.buffer)-1: 
                     # delete the \n at the end of a line
                     self.editop.append_edit("\n")
+                    if ch==120: self.clipboard.store("\n")
                     self.buffer[y] = self.buffer[y] + self.buffer[y+1]
                     del self.buffer[y+1]
                     self.commit_current_edit()
@@ -835,12 +998,15 @@ class Editor(object):
             else:
                 char = self.buffer[y][x]
                 self.editop.append_edit(char)
-                if ch == 120: self.commit_current_edit()
+                if ch == 120: 
+                    self.clipboard.store(char)
+                    self.commit_current_edit()
                 self.buffer[y] = self.buffer[y][:x]+self.buffer[y][x+1:]
         else: # backspace or X
             if x==0:
                 if y > 0:
                     self.editop.append_edit("\n")
+                    if ch==88: self.clipboard.store("\n")
                     lastlen = len(self.buffer[y-1])
                     self.buffer[y-1] = self.buffer[y-1] + self.buffer[y]
                     del self.buffer[y]
@@ -849,7 +1015,9 @@ class Editor(object):
             else:
                 char = self.buffer[y][x-1]
                 self.editop.append_edit(char)
-                if ch == 88: self.commit_current_edit()
+                if ch == 88: 
+                    self.clipboard.store(char)
+                    self.commit_current_edit()
                 self.buffer[y] = self.buffer[y][:x-1]+self.buffer[y][x:]
                 self.pos = y, x-1
         self.refresh()
@@ -880,11 +1048,17 @@ class Editor(object):
                     self.pos = y, x+1
             self.refresh()
             self.refresh_cursor()
-        elif ch==127 or ch==8: # DEL or BACKSPACE
+        elif ch in (curses.KEY_DC, curses.KEY_BACKSPACE, 127): # DEL or BACKSPACE
             self.handle_delete_char(ch)
         elif self.is_direction_char(ch):
             self.handle_cursor_move(ch)
-        elif ch==27: # ESC, to exit editing mode
+        elif ch==curses.KEY_HOME:
+            self.pos = self.pos[0], 0
+            self.refresh_cursor()
+        elif ch==curses.KEY_END:
+            self.pos = self.pos[0], len(self.buffer[self.pos[0]]) if self.buffer[self.pos[0]] else 0
+            self.refresh_cursor()
+        elif ch==27 or ch==curses.ascii.ETX: # ESC, to exit editing mode
             self.mode = "command"
             self.command_editing = False
             self.partial = ""
@@ -903,6 +1077,12 @@ class Editor(object):
         self.scr.move(y,0)
         self.scr.clrtoeol()
 
+    def get_lineno_width(self):
+        if self.showlineno:
+            return len(str(len(self.buffer)))
+        else:
+            return 0
+
     def refresh_cursor(self):
         # move the cursor position based on self.pos
         # when cursor moves beyond top of screen
@@ -911,9 +1091,7 @@ class Editor(object):
             self.refresh()
         screen_y = sum(self.line_heights[:self.pos[0]-self.topline])
         screen_y += self.pos[1]/self.maxx
-        screen_x = self.pos[1]%self.maxx
-        writelog("pos", self.pos[0], self.pos[1])
-        writelog(screen_y, screen_x)
+        screen_x = self.pos[1]%self.maxx + self.get_lineno_width()
 
         if screen_y >= self.maxy-1 and self.topline<len(self.buffer)-1:
             # if the cursor is beyond the bottom of screen, scroll down 1 line and retry
@@ -949,10 +1127,12 @@ class Editor(object):
         _y = 0
         self.line_heights = []
         self.screen_lines = 0
-        for line in self.buffer[self.topline:]:
+        for i, line in enumerate(self.buffer[self.topline:]):
             singleline = line[:self.maxx]
             self.clear_scr_line(_y)
-            self.scr.addstr(_y, 0, singleline)
+            if self.showlineno:
+                self.scr.addstr(_y, 0, str(self.topline+i+1).rjust(self.get_lineno_width()), curses.A_REVERSE)
+            self.scr.addstr(_y, self.get_lineno_width(), singleline)
             idx = self.maxx
             line_height = 1
             self.screen_lines += 1
@@ -963,7 +1143,7 @@ class Editor(object):
                 while idx<len(line):
                     singleline = line[idx:idx+self.maxx]
                     self.clear_scr_line(_y)
-                    self.scr.addstr(_y, 0, singleline)
+                    self.scr.addstr(_y, self.get_lineno_width(), singleline)
                     idx += self.maxx
                     _y+=1
                     line_height += 1
@@ -1002,13 +1182,17 @@ def main():
         f = None
         buf = [""]
     intercept_signals()
-
     editor = Editor(f, buf)
-    curses.wrapper(editor.main_loop)
+    try:
+        curses.wrapper(editor.main_loop)
+    except Exception:
+        editor.outfile = open("before_crash_text", "w")
+        editor.save_file()
+        print "Sorry, pythonvi crashed, your text has been saved in before_crash_text in current directory."
+    finally:
+        if editor.outfile: editor.outfile.close()
+        
 
 if __name__ == "__main__":
     main() 
     
-
-    
-        
